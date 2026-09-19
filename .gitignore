@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Apple ROMs are copyrighted: supply your own (see README)
+roms/*
+!roms/demo.as
+!roms/.gitkeep
+
+# Generated listings (may contain disassembled copyrighted code)
+output/*
+!output/.gitkeep
+
+# Local Claude Code settings
+.claude/settings.local.json
