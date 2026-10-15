@@ -7,7 +7,7 @@ the Apple II, II+, IIe and IIc. It is the Apple II sibling of the
 ## Quick Start
 
 ```bash
-cd 6502-dissasembler
+cd 6502-dissasembler-skill
 claude
 
 /a2-disassemble roms/demo.as    # annotated ca65 disassembly
@@ -90,5 +90,7 @@ python3 -m unittest discover -s tests -v
 
 ## License
 
-MIT, built for the CoCoByte Club
+MIT
+Built for the CoCoByte Club
 by Reinaldo Torres (Chipshift) https://github.com/reyco2000
+reyco2000@cocobyte.co
