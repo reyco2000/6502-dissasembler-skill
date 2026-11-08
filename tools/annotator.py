@@ -32,8 +32,10 @@ import re
 
 try:
     from tools.dasm6502 import ROM_LABELS, HW_LABELS, ZP_LABELS
+    from tools import machines
 except ImportError:
     from dasm6502 import ROM_LABELS, HW_LABELS, ZP_LABELS
+    import machines
 
 CODE_MARKER = "; --- BEGIN CODE ---"
 
@@ -47,6 +49,7 @@ LINE_RE = re.compile(r'^  ([0-9A-F]{4})  ((?:[0-9A-F]{2}|\.\.\.)(?: (?:[0-9A-F]{
 INSTR_RE = re.compile(r'^([A-Z][A-Z0-9]{2,3})\b\s*([^;]*?)\s*(;.*)?$')
 LABEL_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*:$')
 ORG_RE = re.compile(r'^\s*\.org\s+\$', re.IGNORECASE)
+MACHINE_RE = re.compile(r'^; Machine: (\w+)\s*$')
 
 NAME_TO_ADDR = {}
 for _tbl in (ZP_LABELS, HW_LABELS, ROM_LABELS):
@@ -96,6 +99,16 @@ def parse_line(line: str):
     return int(m.group(1), 16), im.group(1), im.group(2).strip(), (im.group(3) or "")
 
 
+def machine_from_lines(lines) -> str | None:
+    """Machine id from a listing / chunk header ('; Machine: c64'). Apple II
+    listings carry no such line."""
+    for line in lines[:40]:
+        m = MACHINE_RE.match(line.rstrip("\n"))
+        if m:
+            return m.group(1)
+    return None
+
+
 def memory_ranges_from_header(lines: list[str]) -> list[tuple[int, int]]:
     ranges = []
     for line in lines:
@@ -120,7 +133,11 @@ class PatternAnnotator:
     in place and is idempotent.
     """
 
-    def __init__(self, ref_dir: str):
+    def __init__(self, ref_dir: str, machine: str = "apple2"):
+        self.machine = machines.resolve(machine)
+        self.prof = machines.MACHINES[self.machine]
+        self.codes = {}       # BBC OSBYTE/OSWORD reason codes: (kind, code) -> (name, desc)
+        self.name_to_addr = NAME_TO_ADDR
         self.rom_calls = {}   # addr -> (name, desc)
         self.hw_regs = {}     # $C000-$CFFF
         self.zp_vars = {}     # $00-$FF
@@ -130,6 +147,9 @@ class PatternAnnotator:
         self._load_references(ref_dir)
 
     def _load_references(self, ref_dir: str):
+        if self.machine != "apple2":
+            self._load_machine(ref_dir)
+            return
         rom_path = os.path.join(ref_dir, "rom_entry_points.md")
         mem_path = os.path.join(ref_dir, "apple2_memory_map.md")
         if os.path.exists(rom_path):
@@ -137,18 +157,35 @@ class PatternAnnotator:
         if os.path.exists(mem_path):
             self._parse_memory_map(mem_path)
 
+    def _load_machine(self, ref_dir: str):
+        """Non-Apple machines: reference/<machine>/*.md via machines.py. A
+        ref_dir that holds a <machine>/ subdirectory (or the tables
+        themselves) overrides the built-in reference/ tree."""
+        root = None
+        if ref_dir:
+            if os.path.isdir(os.path.join(ref_dir, self.machine)):
+                root = os.path.join(ref_dir, self.machine)
+            elif os.path.exists(os.path.join(ref_dir, "memory_map.md")):
+                root = ref_dir
+        ms = machines.MachineSymbols(self.machine, ref_dir=root)
+
+        def named(tbl):   # rows without a usable symbol keep their address as the name
+            return {a: (n or (f"${a:02X}" if a < 0x100 else f"${a:04X}"), d) for a, (n, d) in tbl.items()}
+        self.zp_vars = named(ms.zp)
+        self.hw_regs = named(ms.hw)
+        self.rom_calls = named(ms.rom)
+        self.sys_vars = self.rom_calls
+        self.codes = ms.codes
+        self.name_to_addr = {}
+        for tbl in (ms.zp, ms.hw, ms.rom):
+            for a, (n, _d) in tbl.items():
+                if n:
+                    self.name_to_addr.setdefault(n, a)
+
     @staticmethod
     def _parse_table_rows(filepath: str):
         """Yield (first_col, name, description) from markdown table rows."""
-        with open(filepath) as f:
-            for line in f:
-                line = line.strip()
-                if not line.startswith("|") or line.startswith("|--") or line.startswith("| Address") \
-                        or line.startswith("| Range") or line.startswith("| Code") or line.startswith("| Call"):
-                    continue
-                parts = [p.strip() for p in line.strip("|").split("|")]
-                if len(parts) >= 3:
-                    yield parts[0], parts[1], parts[2]
+        return machines.parse_table_rows(filepath)
 
     def _parse_rom_entry_points(self, filepath: str):
         for key, name, desc in self._parse_table_rows(filepath):
@@ -203,7 +240,7 @@ class PatternAnnotator:
             return int(m.group(1), 16) + int(m.group(2) or 0), idx
         m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)(?:\+(\d+))?$', op)
         if m:
-            base = self.file_names.get(m.group(1), NAME_TO_ADDR.get(m.group(1)))
+            base = self.file_names.get(m.group(1), self.name_to_addr.get(m.group(1)))
             if base is not None:
                 return base + int(m.group(2) or 0), idx
         return None, idx
@@ -263,7 +300,8 @@ class PatternAnnotator:
             if note:
                 notes[i] = note
 
-        self._display_mode_runs(parsed, instr_idx, notes)
+        if self.machine == "apple2":
+            self._display_mode_runs(parsed, instr_idx, notes)
 
         added = 0
         for i, note in notes.items():
@@ -271,6 +309,8 @@ class PatternAnnotator:
             text = note.lstrip("; ").strip()
             if text in line:
                 continue   # idempotent: already annotated
+            if self.machine != "apple2" and " - " in text and text.split(" - ", 1)[1] in line:
+                continue   # the listing already carries this description
             if parsed[i][3]:
                 lines[i] = f"{line} | {text}\n"
             else:
@@ -290,6 +330,10 @@ class PatternAnnotator:
     def _analyze(self, addr, mn, op, cm, prev, nxt, code_addrs, in_image) -> str | None:
         target, idx = self.operand_address(op)
         has_comment = len(cm.lstrip("; ").strip()) > 5
+        if self.machine != "apple2":
+            note = self._analyze_machine(addr, mn, op, target, idx, has_comment, prev, nxt, in_image)
+            if note:
+                return note
 
         # ROM / OS calls (dasm --annotate usually covers these already)
         if mn in ("JSR", "JMP") and target is not None and not idx and not in_image(target):
@@ -302,6 +346,16 @@ class PatternAnnotator:
             name, desc = self.sys_vars[target]
             return f"; jump via {name} - {desc}"
 
+        if self.machine == "apple2":
+            note = self._analyze_apple(addr, mn, op, target, idx, has_comment, prev, nxt, in_image)
+            if note:
+                return note
+
+        return self._analyze_common(addr, mn, op, target, idx, has_comment, prev, nxt, code_addrs,
+                                    in_image)
+
+    def _analyze_apple(self, addr, mn, op, target, idx, has_comment, prev, nxt, in_image):
+        """Apple II soft-switch idioms ($C000-$CFFF)."""
         # Keyboard wait loop: LDA KBD / BPL self
         if target == 0xC000 and mn in ("LDA", "BIT") and nxt and nxt[0][1] == "BPL":
             bt, _ = self.operand_address(nxt[0][2])
@@ -348,7 +402,12 @@ class PatternAnnotator:
                 return f"; slot {slot} I/O register {target & 0xF}"
             if 0xC100 <= target <= 0xC7FF:
                 return f"; slot {(target >> 8) & 7} firmware ROM"
+        return None
 
+    def _analyze_common(self, addr, mn, op, target, idx, has_comment, prev, nxt, code_addrs, in_image):
+        """Patterns that hold on any 6502 machine (tables come from the
+        machine's reference files)."""
+        apple = self.machine == "apple2"
         # Page 2/3 system vectors and ProDOS global page
         if target is not None and target in self.sys_vars and mn in ("STA", "STX", "STY", "LDA", "LDX", "LDY"):
             name, desc = self.sys_vars[target]
@@ -363,11 +422,11 @@ class PatternAnnotator:
             name, desc = self.zp_vars[target]
             if not re.search(r'\$[0-9A-Fa-f]{2}\b', op):
                 return f"; {desc}"
-            if target in COMMON_SYSTEM_ZP:
+            if apple and target in COMMON_SYSTEM_ZP:
                 return f"; {name}? - {desc}"
 
         # Screen memory
-        if target is not None and not in_image(target) and mn in ("STA", "STX", "STY", "STZ", "LDA"):
+        if apple and target is not None and not in_image(target) and mn in ("STA", "STX", "STY", "STZ", "LDA"):
             if 0x0400 <= target <= 0x07FF:
                 return "; text/lo-res page 1 memory"
             if 0x0800 <= target <= 0x0BFF:
@@ -401,13 +460,59 @@ class PatternAnnotator:
                 return f"; {kind} loop through pointer at ${target:02X}" if target is not None else None
 
         # Hi-res page select via immediate
-        if mn == "LDA" and op in ("#$20", "#$40") and nxt and nxt[0][1] == "STA":
+        if apple and mn == "LDA" and op in ("#$20", "#$40") and nxt and nxt[0][1] == "STA":
             t2, _ = self.operand_address(nxt[0][2])
             if t2 == 0xE6:
                 return f"; hi-res page {1 if op == '#$20' else 2} (HPAG)"
 
         if mn == "BRK":
-            return "; BRK: break to monitor (vector $03F0 on II+/IIe)"
+            if apple:
+                return "; BRK: break to monitor (vector $03F0 on II+/IIe)"
+            return {"bbc": "; BRK: error (error number + message follow, via BRKV $0202)",
+                    "cbm": "; BRK: software interrupt (via CBINV $0316)",
+                    "atari8": "; BRK: software interrupt (via VBREAK $0206)"}.get(
+                        self.prof["family"], "; BRK: software interrupt (IRQ/BRK vector)")
+        return None
+
+    # ---------------- other machines ----------------
+
+    def _analyze_machine(self, addr, mn, op, target, idx, has_comment, prev, nxt, in_image):
+        """Non-Apple idioms that must win over the generic table lookups."""
+        # BBC: LDA #code / JSR OSBYTE|OSWORD -> name the reason code
+        if mn in ("JSR", "JMP") and self.codes and target is not None and not idx:
+            kind = {0xFFF4: "OSBYTE", 0xFFF1: "OSWORD"}.get(target)
+            if kind:
+                for p in reversed(prev):
+                    if p[1] == "LDA":
+                        m = re.match(r'^#\$([0-9A-Fa-f]{2})$', p[2].strip())
+                        if m:
+                            code = int(m.group(1), 16)
+                            hit = self.codes.get((kind, code))
+                            if hit:
+                                return f"; {kind} &{code:02X}: {hit[0]} - {hit[1]}"
+                            return f"; {kind} &{code:02X}"
+                        break
+                    if p[1] in ("JSR", "JMP", "RTS", "PLA", "TXA", "TYA"):
+                        break
+        # Stores into OS RAM vectors: interrupt / I/O hooks (wedges)
+        if mn in ("STA", "STX", "STY") and target is not None and not idx \
+                and machines.in_ranges(target, self.prof["os_vectors"]):
+            base, hi = target, False
+            hit = self.sys_vars.get(target)
+            if hit and "+" in hit[0]:
+                base, hi = target - int(hit[0].split("+")[1]), True
+            elif not hit and target - 1 in self.sys_vars:
+                base, hi = target - 1, True
+            hit = self.sys_vars.get(base)
+            if hit and hit[0]:
+                return f"; hook: patches {hit[0]} vector ({'high' if hi else 'low'} byte)"
+        # Hardware registers by table (Apple keeps its own soft-switch logic)
+        if target is not None and target in self.hw_regs and not has_comment and mn != "JSR":
+            name, desc = self.hw_regs[target]
+            return f"; {name} - {desc}" if name else f"; {desc}"
+        if target is not None and not has_comment and mn not in ("JSR", "JMP") \
+                and machines.in_ranges(target, self.prof["hw"]) and not in_image(target):
+            return f"; {self.prof['title']} I/O register ${target:04X}"
         return None
 
     @staticmethod
@@ -456,8 +561,11 @@ def do_split(args):
 
     header_lines, first_code_idx = extract_header(asm_lines)
     header_text = "".join(header_lines)
+    machine = machine_from_lines(asm_lines) or "apple2"
+    hw_title = "Soft switches" if machine == "apple2" else "Hardware I/O"
 
     manifest = {
+        "machine": machine,
         "source_asm": os.path.abspath(args.asm),
         "source_sections": os.path.abspath(args.sections),
         "total_chunks": len(sections),
@@ -486,7 +594,7 @@ def do_split(args):
                f"; CHUNK {chunk_id} of {len(sections)} -- {start_hex} to {end_hex} ({len(chunk_lines)} lines)",
                "; ============================================="]
         for key, title, limit in (("subroutines", "Subroutines", 40), ("rom_calls", "ROM calls", 40),
-                                  ("hw_accesses", "Soft switches", 40), ("self_modifying", "Self-modified", 20),
+                                  ("hw_accesses", hw_title, 40), ("self_modifying", "Self-modified", 20),
                                   ("calls_out", "Calls out", 15), ("called_from", "Called from", 10)):
             vals = section.get(key) or []
             if vals:
@@ -543,7 +651,13 @@ def _chunk_path(chunk_info, manifest_path):
 def do_annotate(args):
     with open(args.manifest) as f:
         manifest = json.load(f)
-    annotator = PatternAnnotator(args.ref_dir)
+    machine = getattr(args, "machine", None) or manifest.get("machine")
+    if not machine and manifest["chunks"]:
+        with open(_chunk_path(manifest["chunks"][0], args.manifest)) as f:
+            machine = machine_from_lines(f.readlines())
+    annotator = PatternAnnotator(args.ref_dir, machine or "apple2")
+    if annotator.machine != "apple2":
+        print(f"Machine: {annotator.machine}", file=sys.stderr)
     total = 0
     for c in manifest["chunks"]:
         added = annotator.annotate_file(_chunk_path(c, args.manifest))
@@ -669,6 +783,9 @@ def main():
     parser.add_argument("--output-dir", help="Output directory (for --split)")
     parser.add_argument("--manifest", help="Manifest JSON (for --annotate/--merge)")
     parser.add_argument("--ref-dir", help="Reference directory (for --annotate)")
+    parser.add_argument("--machine", default=None,
+                        help="With --annotate: machine tables to use (default: from the manifest / "
+                             "chunk header, else apple2)")
     parser.add_argument("--output", "-o", help="Output file (for --merge)")
     parser.add_argument("--reassemble", action="store_true",
                         help="With --merge: strip address/hex columns so ca65 can assemble the result")

@@ -27,7 +27,8 @@ except ImportError:
 
 
 def is_hw(addr: int) -> bool:
-    """Soft switches, slot I/O and the $CFFF expansion-ROM release."""
+    """Apple II soft switches, slot I/O and the $CFFF expansion-ROM release.
+    (The analysis itself uses dasm.mt.is_hw, which follows --machine.)"""
     return 0xC000 <= addr <= 0xC0FF or addr == 0xCFFF
 
 
@@ -82,7 +83,7 @@ class CrossReferenceBuilder:
                     self.rom_calls[v].append(pc)
             elif ins.mode in ABS_MODES:
                 self.data_refs[v].append(pc)
-                if is_hw(v):
+                if d.mt.is_hw(v):
                     self.hw_accesses[v].append(pc)
                 if m in ("STA", "STX", "STY", "STZ") and v in code_bytes and not d.rom_name:
                     self.stores_to_code[v].append(pc)
@@ -156,7 +157,9 @@ class CrossReferenceBuilder:
             out.append("")
 
         if self.hw_accesses:
-            out.append(f"--- Soft switches / I/O ({len(self.hw_accesses)}) ---")
+            what = "Soft switches / I/O" if self.dasm.machine == "apple2" else \
+                f"Hardware I/O ({self.dasm.mt.title})"
+            out.append(f"--- {what} ({len(self.hw_accesses)}) ---")
             for a in sorted(self.hw_accesses):
                 refs = self.hw_accesses[a]
                 out.append(f"  {self.name(a):16s} ${a:04X}  x{len(refs):<3d} from: "

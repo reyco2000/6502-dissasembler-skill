@@ -9,8 +9,7 @@ Produces annotated **ca65** assembly via a chunked pipeline that keeps
 main-agent context small: read only tool stdout and the manifest, never
 the full listing or xref output.
 
-Run all commands from `/home/pi/proyectos/6502-dissasembler/` (paths below
-are relative). `<name>` = input file basename. `<flags>` = the load/CPU
+Run all commands from the repository root (paths below are relative). `<name>` = input file basename. `<flags>` = the load/CPU
 flags from step 1. Pass the **same** `<flags>` to steps 2 and 3, or the
 chunk boundaries won't match the listing.
 
@@ -18,7 +17,9 @@ chunk boundaries won't match the listing.
 
 ## Steps
 
-1. **Identify**: `python3 tools/a2loader.py <file>`
+1. **Identify**: `python3 tools/loader.py <file>` (Apple II files report no
+   `--machine`, or `--machine apple2`; other machines have their own skills:
+   cbm-, atari8-, bbc-, nes-, lynx-disassemble)
    - **AppleSingle** (ProDOS export from CiderPress / AppleCommander / cc65):
      load address comes from the aux type (BIN) or $2000 (SYS). No `--org`.
    - **DOS 3.3 binary with 4-byte header**, or a filename like `GAME#062000`:
@@ -34,7 +35,9 @@ chunk boundaries won't match the listing.
      needs an enhanced IIe/IIc. If a 6502 listing is full of `.byte` in code
      paths (e.g. `$80`, `$64`, `$DA`), retry with `--cpu 65c02`. Use
      `--cpu r65c02` only for Rockwell BBR/BBS/RMB/SMB code (not Apple
-     hardware). `--undocumented` enables NMOS illegal opcodes (6502X).
+     hardware), `--cpu w65c02` for WDC code that also uses STP/WAI. On every
+     CMOS CPU, reserved opcodes are traced as NOPs of their real width (1-3
+     bytes) and emitted as `.byte`. `--undocumented` enables NMOS illegal opcodes (6502X).
    - **Extra entry points**: add `--entry 0xNNNN` (repeatable) for code that is
      only reached indirectly (`&` / `USR` handlers, documented ROM entries
      reached through hooks such as COUT1 $FDF0, the address after a JSR to a

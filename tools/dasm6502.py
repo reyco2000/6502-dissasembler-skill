@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dasm6502.py — 6502 / 65C02 disassembler engine for Apple II analysis
+dasm6502.py — 6502 / 65C02 disassembler engine (Apple II, Commodore, Atari, BBC, NES, Lynx)
 Usage: python3 dasm6502.py <file> [--org 0x2000] [--cpu 65c02] [--entry 0x2000]
                            [--annotate] [--no-hex] [--output file.s]
 
@@ -23,11 +23,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 try:
-    from tools.a2loader import load_image
+    from tools.loader import load_image
     from tools.symbols import SymbolTable, load_symbols
+    from tools import machines
 except ImportError:
-    from a2loader import load_image
+    from loader import load_image
     from symbols import SymbolTable, load_symbols
+    import machines
 
 # ===========================================================================
 # ADDRESSING MODES
@@ -52,7 +54,7 @@ ZPREL = "zprel"      # $nn,label    Rockwell BBR/BBS
 
 MODE_SIZE = {IMP: 0, ACC: 0, IMM: 1, ZP: 1, ZPX: 1, ZPY: 1, ABS: 2, ABSX: 2,
              ABSY: 2, IND: 2, INDX: 1, INDY: 1, REL: 1, ZPIND: 1, ABSINDX: 2,
-             ZPREL: 2}
+             ZPREL: 2, "rsv": 0}
 
 # Modes whose operand is a 16-bit memory address
 ABS_MODES = (ABS, ABSX, ABSY, IND, ABSINDX)
@@ -146,7 +148,28 @@ OPCODES_UNDOC = {
     0xCB: ("AXS", IMM), 0xBB: ("LAS", ABSY),
 }
 
-CPU_TABLES = {"6502": OPCODES_6502, "65c02": OPCODES_65C02, "r65c02": OPCODES_R65C02}
+# WDC W65C02S: Rockwell bit ops plus WAI ($CB) and STP ($DB)
+OPCODES_W65C02 = {**OPCODES_R65C02, 0xCB: ("WAI", IMP), 0xDB: ("STP", IMP)}
+
+CPU_TABLES = {"6502": OPCODES_6502, "65c02": OPCODES_65C02, "r65c02": OPCODES_R65C02,
+              "w65c02": OPCODES_W65C02,
+              "65sc02": OPCODES_65C02,   # Synertek/VLSI 65SC02 (Atari Lynx): base CMOS set
+              "65c12": OPCODES_65C02}    # GTE 65C12 (BBC Master): same set as the 65SC02
+CMOS_CPUS = {"65c02", "r65c02", "w65c02", "65sc02", "65c12"}
+# ca65 .setcpu name per CPU. ca65 has no W65C02 mode in older releases;
+# "65C02" + STP/WAI as .byte keeps the output reassemblable everywhere.
+CA65_CPU = {"6502": "6502", "65c02": "65C02", "r65c02": "65C02", "w65c02": "65C02",
+            "65sc02": "65SC02", "65c12": "65SC02"}
+# Mnemonics ca65's chosen CPU mode can't assemble: emitted as .byte
+CA65_UNSUPPORTED = {"w65c02": {"WAI", "STP"}}
+
+# CMOS reserved opcodes are defined NOPs (WDC/Rockwell data sheets): the
+# CPU skips 1, 2 or 3 bytes. Tracing steps over them; the listing emits
+# them as .byte, since no assembler has mnemonics for them.
+CMOS_NOP_SIZE = {op: 1 for op in range(256) if (op & 0x0F) in (0x03, 0x0B, 0x07, 0x0F)}
+CMOS_NOP_SIZE.update({0x02: 2, 0x22: 2, 0x42: 2, 0x62: 2, 0x82: 2, 0xC2: 2, 0xE2: 2,
+                      0x44: 2, 0x54: 2, 0xD4: 2, 0xF4: 2, 0x5C: 3, 0xDC: 3, 0xFC: 3})
+RSV = "rsv"   # mode of a reserved-opcode NOP (operand bytes skipped, never formatted)
 
 BRANCHES = {"BPL", "BMI", "BVC", "BVS", "BCC", "BCS", "BNE", "BEQ", "BRA"} | \
            {f"BBR{n}" for n in range(8)} | {f"BBS{n}" for n in range(8)}
@@ -399,6 +422,53 @@ def hw_comment(addr: int) -> str:
     return ""
 
 
+class MachineTables:
+    """The symbol view one disassembly uses: built-in ROM/OS, hardware and
+    zero-page names + descriptions, inline-argument calls and the hardware
+    comment function. Apple II uses the hand-tuned dicts above; every other
+    machine is built from reference/<machine>/*.md (machines.py)."""
+
+    def __init__(self, machine: str = "apple2"):
+        self.machine = machines.resolve(machine)
+        self.prof = machines.MACHINES[self.machine]
+        self.title = self.prof["title"]
+        if self.machine == "apple2":
+            self.rom_labels, self.rom_desc = ROM_LABELS, ROM_DESCRIPTIONS
+            self.hw_labels, self.hw_desc = HW_LABELS, HW_DESCRIPTIONS
+            self.zp_labels, self.zp_desc = ZP_LABELS, ZP_DESCRIPTIONS
+            self.inline_calls = INLINE_ARG_CALLS
+            self.codes = {}
+            self.offsets = {}
+            return
+        ms = machines.load_machine_symbols(self.machine)
+        self.rom_labels, self.rom_desc = ms.labels(ms.rom), ms.descriptions(ms.rom)
+        self.hw_labels, self.hw_desc = ms.labels(ms.hw), ms.descriptions(ms.hw)
+        self.zp_labels = ms.labels(ms.zp, allow_offset=True)
+        self.zp_desc = ms.descriptions(ms.zp)
+        self.inline_calls = dict(self.prof["inline_calls"])
+        self.codes = ms.codes
+        # "CINV+1" style rows (high byte of a vector): addr -> (base addr, n)
+        self.offsets = {}
+        for tbl, labels in ((ms.rom, self.rom_labels), (ms.hw, self.hw_labels)):
+            for a, (n, _d) in tbl.items():
+                if n and "+" in n:
+                    base, off = n.split("+", 1)
+                    if off.isdigit() and labels.get(a - int(off)) == base:
+                        self.offsets[a] = (a - int(off), int(off))
+
+    def is_hw(self, addr: int) -> bool:
+        if self.machine == "apple2":
+            return 0xC000 <= addr <= 0xC0FF or addr == 0xCFFF
+        return machines.in_ranges(addr, self.prof["hw"])
+
+    def hw_comment(self, addr: int) -> str:
+        """Comment for a data access to a fixed address outside the image."""
+        if self.machine == "apple2":
+            return hw_comment(addr)
+        d = self.hw_desc.get(addr) or self.rom_desc.get(addr)
+        return f"; {d}" if d else ""
+
+
 # ===========================================================================
 # MEMORY IMAGE
 # ===========================================================================
@@ -466,6 +536,7 @@ class Instr:
     value: Optional[int] = None   # operand; for REL/ZPREL the resolved target
     zp: Optional[int] = None      # ZPREL zero-page operand
     valid: bool = True
+    reserved: bool = False        # CMOS reserved opcode decoded as a NOP
 
 
 def is_printable(b: int) -> bool:
@@ -512,11 +583,15 @@ class Disassembler6502:
                  undocumented: bool = False, entries: list = None, fill="validated",
                  exclude: list = None, zp_names: bool = False, tables: list = None,
                  symbols: "SymbolTable" = None, data_regions: list = None,
-                 auto_tables: bool = True):
+                 auto_tables: bool = True, machine: str = "apple2"):
         self.mem = mem
+        self.mt = MachineTables(machine)
+        self.machine = self.mt.machine
         self.entry_addr = entry_addr
         self.cpu = cpu
         self.undocumented = undocumented
+        if cpu not in CPU_TABLES:
+            raise ValueError(f"unknown cpu {cpu!r}; known: {', '.join(CPU_TABLES)}")
         self.table = dict(CPU_TABLES[cpu])
         if undocumented and cpu == "6502":
             self.table.update(OPCODES_UNDOC)
@@ -563,6 +638,7 @@ class Disassembler6502:
         self.used_zp: set[int] = set()
         self.used_user: set[int] = set()
         self.used_hasc = False
+        self.vector_hooks: dict[int, str] = {}   # handler addr -> OS vector name
         self._analyzed = False
 
     # ---------------- decoding ----------------
@@ -575,6 +651,9 @@ class Disassembler6502:
         op = self.mem.byte_at(pc)
         entry = self.table.get(op)
         if entry is None:
+            n = CMOS_NOP_SIZE.get(op) if self.cpu in CMOS_CPUS else None
+            if n and all(self.mem.is_populated(pc + i) for i in range(n)):
+                return Instr(pc, op, "NOP", RSV, n, reserved=True)
             return Instr(pc, op, None, IMP, 1, valid=False)
         mnemonic, mode = entry
         size = 1 + MODE_SIZE[mode]
@@ -612,7 +691,7 @@ class Disassembler6502:
         n = self.sym.name(addr)
         if n and "+" not in n:
             return n
-        for tbl in (ROM_LABELS, HW_LABELS):
+        for tbl in (self.mt.rom_labels, self.mt.hw_labels):
             if addr in tbl and self._builtin_ok(tbl[addr], addr):
                 return tbl[addr]
         return None
@@ -622,7 +701,7 @@ class Disassembler6502:
         c = self.sym.comment(addr)
         if c:
             return c
-        return ROM_DESCRIPTIONS.get(addr) or HW_DESCRIPTIONS.get(addr) or ""
+        return self.mt.rom_desc.get(addr) or self.mt.hw_desc.get(addr) or ""
 
     def addr_label(self, addr: int) -> str:
         if addr in self.labels:
@@ -692,7 +771,8 @@ class Disassembler6502:
                 if not self.mem.is_populated(pc) or pc in self.owner or pc in self.exclude:
                     break
                 ins = self.decode(pc)
-                if ins is None or not ins.valid or not self._can_place(ins):
+                if ins is None or not ins.valid or not self._can_place(ins) \
+                        or (ins.reserved and not core):
                     break
                 self._place(ins, traced=core)
                 if not core:
@@ -701,7 +781,7 @@ class Disassembler6502:
                 m = ins.mnemonic
                 if m == "JSR":
                     work.append(ins.value)
-                    inline = INLINE_ARG_CALLS.get(ins.value)
+                    inline = self.mt.inline_calls.get(ins.value)
                     if inline:
                         kind, n = inline
                         start = pc + ins.size
@@ -729,7 +809,7 @@ class Disassembler6502:
                     work.append(ins.value)
                     if m == "BRA":
                         break
-                elif m in ("RTS", "RTI", "BRK"):
+                elif m in ("RTS", "RTI", "BRK", "STP"):
                     break
                 pc += ins.size
 
@@ -879,6 +959,57 @@ class Disassembler6502:
                     a += 1
         return found
 
+    _WRITES = {"A": {"LDA", "PLA", "TXA", "TYA", "ADC", "SBC", "AND", "ORA", "EOR", "ASL", "LSR",
+                     "ROL", "ROR", "INC", "DEC", "LAX"},
+               "X": {"LDX", "TAX", "INX", "DEX", "PLX", "TSX", "LAX", "AXS"},
+               "Y": {"LDY", "TAY", "INY", "DEY", "PLY"}}
+
+    def _detect_vector_hooks(self) -> list:
+        """LDx #<h / STx VEC / LDx #>h / STx VEC+1 into an OS RAM vector
+        (C64 CINV $0314, Atari VVBLKI $0222, BBC WRCHV $020E ...): h is
+        an interrupt / I/O handler, so it becomes an entry point.
+        Apple II is left out (its listings are kept byte-stable)."""
+        vecs = self.mt.prof["os_vectors"]
+        if self.machine == "apple2" or not vecs:
+            return []
+        writes: dict[int, tuple] = {}     # vector byte -> (value, store pc)
+        regs: dict[str, int] = {}
+        prev_end = None
+        for pc in sorted(self.instrs):
+            ins = self.instrs[pc]
+            if pc != prev_end or pc in self.jump_targets or pc in self.call_targets:
+                regs = {}
+            prev_end = pc + ins.size
+            m = ins.mnemonic
+            if m in ("LDA", "LDX", "LDY") and ins.mode == IMM:
+                regs[m[2]] = ins.value
+                continue
+            if m in ("STA", "STX", "STY") and ins.mode == ABS and machines.in_ranges(ins.value, vecs):
+                if m[2] in regs:
+                    writes[ins.value] = (regs[m[2]], pc)
+                continue
+            for r, ms in self._WRITES.items():
+                if m in ms and not (ins.mode == ACC and r != "A"):
+                    regs.pop(r, None)
+            if m in FLOW_END or m == "JSR":
+                regs = {}
+        found = []
+        for v, (lo, pc_lo) in sorted(writes.items()):
+            if v + 1 not in writes:
+                continue
+            hi, pc_hi = writes[v + 1]
+            if abs(pc_hi - pc_lo) > 24:
+                continue
+            target = lo | (hi << 8)
+            name = self.mt.rom_labels.get(v) or f"${v:04X}"
+            self.vector_hooks.setdefault(target, name)
+            if self.mem.is_populated(target):
+                self.add_target_label(target, is_call=True)
+                if target not in self.owner:
+                    found.append(target)
+                    self.auto_found.append(f"{name} hook ${target:04X}")
+        return found
+
     def _fill_validated(self):
         """Sweep unreached gaps: accept a gap as code only if it is vouched
         (a branch/call target, or directly after a terminal traced
@@ -920,7 +1051,7 @@ class Disassembler6502:
         pc, n = start, 0
         while pc <= end:
             ins = self.decode(pc)
-            if ins is None or not ins.valid or pc + ins.size - 1 > end:
+            if ins is None or not ins.valid or ins.reserved or pc + ins.size - 1 > end:
                 return False
             n += 1
             if ins.mnemonic in TERMINALS:
@@ -948,7 +1079,8 @@ class Disassembler6502:
                 pc = a
                 continue
             ins = self.decode(pc)
-            if ins is None or not ins.valid or ins.pc + ins.size - 1 > end or not self._can_place(ins):
+            if ins is None or not ins.valid or ins.reserved or ins.pc + ins.size - 1 > end \
+                    or not self._can_place(ins):
                 self.data_kind[pc] = "byte"
                 pc += 1
                 continue
@@ -991,6 +1123,7 @@ class Disassembler6502:
         # (User-named addresses are not entry points by themselves: naming
         # alone doesn't make bytes code.)
         self._trace(list(reversed(entries)))
+        self._trace(self._detect_vector_hooks())
 
         # Strings / fills first so table detection never scans text
         self.data_kind.update(detect_data_regions(
@@ -1000,6 +1133,8 @@ class Disassembler6502:
         if self.auto_tables:
             for _ in range(10):
                 new = self._detect_jump_tables()
+                self._trace(new)
+                new += self._detect_vector_hooks()
                 self._trace(new)
                 ptr = self._detect_pointer_tables()
                 self._trace(ptr)
@@ -1089,12 +1224,20 @@ class Disassembler6502:
         u = self._user_ref(addr)
         if u:
             return u
-        if addr in ROM_LABELS and self._builtin_ok(ROM_LABELS[addr], addr):
+        rom, hw = self.mt.rom_labels, self.mt.hw_labels
+        if addr in rom and self._builtin_ok(rom[addr], addr):
             self.used_rom.add(addr)
-            return ROM_LABELS[addr]
-        if addr in HW_LABELS and self._builtin_ok(HW_LABELS[addr], addr):
+            return rom[addr]
+        if addr in hw and self._builtin_ok(hw[addr], addr):
             self.used_hw.add(addr)
-            return HW_LABELS[addr]
+            return hw[addr]
+        if addr in self.mt.offsets:
+            base, n = self.mt.offsets[addr]
+            if not self.mem.is_populated(base):
+                name = rom.get(base) or hw.get(base)
+                if self._builtin_ok(name, base):
+                    (self.used_rom if base in rom else self.used_hw).add(base)
+                    return f"{name}+{n}"
         if addr in self.labels:
             return self.labels[addr]
         return f"${addr:04X}"
@@ -1107,13 +1250,14 @@ class Disassembler6502:
         u = self._user_ref(addr)
         if u:
             return u
-        if self.zp_names and addr in ZP_LABELS and self._builtin_ok(
-                ZP_LABELS[addr].split("+")[0],
-                addr - int(ZP_LABELS[addr].split("+")[1]) if "+" in ZP_LABELS[addr] else addr):
-            name = ZP_LABELS[addr]
+        zp = self.mt.zp_labels
+        if self.zp_names and addr in zp and self._builtin_ok(
+                zp[addr].split("+")[0],
+                addr - int(zp[addr].split("+")[1]) if "+" in zp[addr] else addr):
+            name = zp[addr]
             # "LINNUM+1" style names: define only the base symbol
             self.used_zp.add(addr - int(name.split("+")[1]) if "+" in name else addr)
-            return ZP_LABELS[addr]
+            return zp[addr]
         return f"${addr:02X}"
 
     def format_operand(self, ins: Instr) -> str:
@@ -1166,10 +1310,15 @@ class Disassembler6502:
             return (".byte", "$??", 1, "; unpopulated")
         if not ins.valid:
             return (".byte", f"${ins.opcode:02X}", 1, "; undefined opcode")
+        if ins.reserved or ins.mnemonic in CA65_UNSUPPORTED.get(self.cpu, ()):
+            raw = ",".join(f"${self.mem.byte_at(ins.pc + i):02X}" for i in range(ins.size))
+            what = f"reserved opcode: {ins.size}-byte NOP on CMOS" if ins.reserved else \
+                f"{ins.mnemonic} (WDC 65C02)"
+            return (".byte", raw, ins.size, f"; {what}")
         comment = ""
         if ins.mode in ABS_MODES and ins.mnemonic not in ("JSR", "JMP"):
             c = self.sym.comment(ins.value)
-            comment = f"; {c}" if c else hw_comment(ins.value)
+            comment = f"; {c}" if c else self.mt.hw_comment(ins.value)
         return (ins.mnemonic, self.format_operand(ins), ins.size, comment)
 
     def _string_lines(self, pc: int, end: int, kind: str) -> tuple:
@@ -1218,6 +1367,13 @@ class Disassembler6502:
                             comment = f"{comment} | {note[2:]}" if comment else note
                         if pc in self.backward_branches:
                             comment = (comment + " (loop)") if comment else "; loop back"
+                        if pc in self.vector_hooks:
+                            note = f"; handler installed in {self.vector_hooks[pc]}"
+                            comment = f"{comment} | {note[2:]}" if comment else note
+                        if ins.mnemonic == "JMP" and ins.mode == IND and (ins.value & 0xFF) == 0xFF \
+                                and self.cpu == "6502":
+                            note = f"; NMOS page-wrap bug: high byte read from ${ins.value & 0xFF00:04X}"
+                            comment = f"{comment} | {note[2:]}" if comment else note
                     self.lines.append((pc, self.instr_bytes(ins), mnemonic, operand, comment))
                     pc += consumed
                     continue
@@ -1312,15 +1468,17 @@ class Disassembler6502:
     def _format_output(self, show_hex: bool, annotate: bool) -> str:
         out = []
         line_starts = {pc for (pc, *_r) in self.lines}
-        cpu_name = "6502X" if (self.cpu == "6502" and self.undocumented) else \
-                   ("65C02" if self.cpu != "6502" else "6502")
+        cpu_name = "6502X" if (self.cpu == "6502" and self.undocumented) else CA65_CPU[self.cpu]
 
         out.append("; =============================================")
-        out.append(f"; Apple II {self.cpu.upper()} disassembly (ca65 syntax)")
+        out.append(f"; {self.mt.title} {self.cpu.upper()} disassembly (ca65 syntax)")
         out.append("; =============================================")
+        if self.machine != "apple2":
+            out.append(f"; Machine: {self.machine}")
         if self.rom_name:
             out.append(f"; ROM image: {self.rom_name}")
-            out.append("; (stores into $D000-$FFFF write language-card RAM, not this ROM)")
+            if self.mt.prof["rom_note"]:
+                out.append(f"; {self.mt.prof['rom_note']}")
         out.append(f'                 .setcpu "{cpu_name}"')
         out.append("")
 
@@ -1339,18 +1497,21 @@ class Disassembler6502:
             out.append("; ROM / OS Entry Points Used")
             out.append("; =============================================")
             for addr in rom_eq:
-                desc = f"  ; {ROM_DESCRIPTIONS[addr]}" if annotate and addr in ROM_DESCRIPTIONS else ""
-                out.append(f"{ROM_LABELS[addr]:16s} = ${addr:04X}{desc}")
+                d = self.mt.rom_desc.get(addr)
+                desc = f"  ; {d}" if annotate and d else ""
+                out.append(f"{self.mt.rom_labels[addr]:16s} = ${addr:04X}{desc}")
             out.append("")
 
         hw_eq = sorted(a for a in self.used_hw if not self.mem.is_populated(a))
         if hw_eq:
             out.append("; =============================================")
-            out.append("; Hardware I/O (soft switches)")
+            out.append("; Hardware I/O (soft switches)" if self.machine == "apple2"
+                       else f"; Hardware I/O ({self.mt.title})")
             out.append("; =============================================")
             for addr in hw_eq:
-                desc = f"  ; {HW_DESCRIPTIONS[addr]}" if addr in HW_DESCRIPTIONS else ""
-                out.append(f"{HW_LABELS[addr]:16s} = ${addr:04X}{desc}")
+                d = self.mt.hw_desc.get(addr)
+                desc = f"  ; {d}" if d else ""
+                out.append(f"{self.mt.hw_labels[addr]:16s} = ${addr:04X}{desc}")
             out.append("")
 
         zp_eq = sorted(a for a in self.used_zp if not self.mem.is_populated(a))
@@ -1359,8 +1520,9 @@ class Disassembler6502:
             out.append("; Zero Page")
             out.append("; =============================================")
             for addr in zp_eq:
-                desc = f"  ; {ZP_DESCRIPTIONS[addr]}" if addr in ZP_DESCRIPTIONS else ""
-                out.append(f"{ZP_LABELS[addr]:16s} = ${addr:02X}{desc}")
+                d = self.mt.zp_desc.get(addr)
+                desc = f"  ; {d}" if d else ""
+                out.append(f"{self.mt.zp_labels[addr]:16s} = ${addr:02X}{desc}")
             out.append("")
 
         user_eq = sorted(a for a in self.used_user if not self.mem.is_populated(a))
@@ -1513,13 +1675,18 @@ def parse_range(spec: str) -> tuple:
 
 
 def build_disassembler(args) -> tuple:
-    segments, info = load_image(args.file, org=args.org, raw=args.raw)
+    want = getattr(args, "machine", "auto") or "auto"
+    segments, info = load_image(args.file, org=args.org, raw=args.raw,
+                                machine=None if want == "auto" else machines.resolve(want),
+                                bank=getattr(args, "bank", None))
+    machine = machines.resolve(want) if want != "auto" else (info.get("machine_id") or "apple2")
+    info["machine_id"] = machine
     mem = MemoryImage()
     for org, data in segments:
         mem.load_segment(org, data)
     cpu = args.cpu
     if cpu == "auto":
-        cpu = info.get("cpu_hint") or "6502"
+        cpu = info.get("cpu_hint") or machines.MACHINES[machine]["default_cpu"]
     entry = info.get("entry")
     tables = [parse_table_spec(t) for t in args.table]
     symbols = load_symbols(args.symbols)
@@ -1530,19 +1697,37 @@ def build_disassembler(args) -> tuple:
     dasm = Disassembler6502(mem, entry_addr=entry, cpu=cpu, undocumented=args.undocumented,
                             entries=args.entry, fill=fill, exclude=info.get("exclude"),
                             zp_names=args.zp_names or bool(info.get("is_rom")), tables=tables,
-                            symbols=symbols, data_regions=regions, auto_tables=not args.no_auto_tables)
+                            symbols=symbols, data_regions=regions, auto_tables=not args.no_auto_tables,
+                            machine=machine)
+    dasm.entries += [e for e in info.get("entries", []) if e not in dasm.entries]
     if info.get("is_rom"):
         dasm.rom_name = info.get("rom_name") or "ROM"
     return dasm, info
 
 
+def _machine_arg(s: str) -> str:
+    if s == "auto":
+        return s
+    try:
+        return machines.resolve(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
 def add_common_args(parser):
-    parser.add_argument("file", help="Binary, AppleSingle, or ROM image")
+    parser.add_argument("file", help="Binary, ROM image, or container (AppleSingle, DOS 3.3, "
+                                     "CBM .prg, Atari .xex, iNES .nes, Lynx .lnx/BLL .o, BBC ROM/.inf)")
     parser.add_argument("--org", type=lambda x: int(x, 0), default=None,
-                        help="Load address (hex, e.g. 0x2000); auto for AppleSingle/DOS 3.3")
+                        help="Load address (hex, e.g. 0x2000); auto for containers")
     parser.add_argument("--raw", action="store_true", help="Skip container detection")
-    parser.add_argument("--cpu", choices=["auto", "6502", "65c02", "r65c02"], default="auto",
-                        help="CPU (default: auto from ROM ID bytes, else 6502)")
+    parser.add_argument("--machine", default="auto", type=_machine_arg, metavar="MACHINE",
+                        help="Target machine for symbols: " + ", ".join(machines.MACHINES) +
+                             " (default: auto from the file, else apple2)")
+    parser.add_argument("--bank", type=int, default=None,
+                        help="iNES: map this 16K PRG bank at $8000 (the last bank is always at $C000)")
+    parser.add_argument("--cpu", choices=["auto"] + list(CPU_TABLES), default="auto",
+                        help="CPU (default: auto from ROM ID bytes / machine profile, else 6502). "
+                             "65sc02 = Lynx, 65c12 = BBC Master, w65c02 = WDC (STP/WAI + bit ops)")
     parser.add_argument("--undocumented", action="store_true",
                         help="Decode NMOS undocumented opcodes (ca65 6502X)")
     parser.add_argument("--entry", type=lambda x: int(x, 0), action="append", default=[],
@@ -1553,7 +1738,7 @@ def add_common_args(parser):
     parser.add_argument("--no-presets", action="store_true",
                         help="Ignore dispatch tables the loader recognizes in known ROMs")
     parser.add_argument("--zp-names", action="store_true",
-                        help="Use Monitor/Applesoft zero-page names (default on for ROM images)")
+                        help="Use the machine's zero-page names (default on for ROM images)")
     parser.add_argument("--symbols", action="append", default=[], metavar="FILE",
                         help="Symbol file (repeatable): orchard schema-v1.0 JSON, flat JSON, "
                              "or ca65 'NAME = $XXXX ; comment' lines. First definition wins; "
@@ -1570,7 +1755,8 @@ def add_common_args(parser):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="6502/65C02 disassembler for Apple II")
+    parser = argparse.ArgumentParser(description="6502/65C02 disassembler for Apple II, Commodore, "
+                                                 "Atari 8-bit/Lynx, BBC Micro and NES")
     add_common_args(parser)
     parser.add_argument("--output", "-o", help="Output file (default: stdout)")
     parser.add_argument("--no-hex", action="store_true",
@@ -1586,7 +1772,7 @@ def main():
     for s in info["segments"]:
         print(f";   ${s['org']:04X}-${s['org'] + s['length'] - 1:04X} ({s['length']} bytes)", file=sys.stderr)
     if info.get("entry") is not None:
-        print(f"; Entry: ${info['entry']:04X}  CPU: {dasm.cpu}", file=sys.stderr)
+        print(f"; Entry: ${info['entry']:04X}  CPU: {dasm.cpu}  Machine: {dasm.machine}", file=sys.stderr)
     for n in info["notes"]:
         print(f"; {n}", file=sys.stderr)
 

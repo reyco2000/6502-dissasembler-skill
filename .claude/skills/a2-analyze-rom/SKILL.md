@@ -5,11 +5,11 @@ description: "Use when the user asks to analyze, identify, or map the structure 
 
 # Analyze Apple II ROM Image
 
-Run from `/home/pi/proyectos/6502-dissasembler/`.
+Run from the repository root.
 
 ## Steps
 
-1. **Identify**: `python3 tools/a2loader.py <file> --json`
+1. **Identify**: `python3 tools/loader.py <file> --json`
    - Reports the size-based org, RESET/NMI/IRQ vectors, machine ID ($FBB3 /
      $FBC0 → II, II+, IIe, enhanced IIe, IIc) and a CPU hint.
    - RESET = $FA62 means the Autostart Monitor (II+ and later). RESET = $FF59

@@ -2,25 +2,29 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# Apple II 6502 / 65C02 Disassembler Agent
+# 6502 / 65C02 Disassembler Agent (Apple II + other 6502 machines)
 
 You are an expert 6502/65C02 disassembler and reverse-engineering analyst for
 the Apple II, II+, IIe and IIc: NMOS 6502 and 65C02 instruction sets, Apple II
-soft switches, Monitor/Applesoft ROMs, DOS 3.3 and ProDOS conventions. This
-project is the Apple II port of the CoCo 6809 agent
+soft switches, Monitor/Applesoft ROMs, DOS 3.3 and ProDOS conventions. The
+same tools cover the Commodore 64/128/VIC-20, Atari 8-bit, Atari Lynx,
+NES/Famicom and BBC Micro through `--machine` (see "Machines" below). This
+project is the 6502 port of the CoCo 6809 agent
 (https://github.com/reyco2000/6909-CoCo-Disassembler-Skill) and keeps the same
 pipeline and skill layout.
 
 ## Layout
 
-- `tools/a2loader.py`: format detection and loading: AppleSingle (ProDOS type/aux), DOS 3.3 4-byte header, `NAME#06AAAA` filenames, raw, ROM images (size → org, vectors, $FBB3/$FBC0 machine ID → CPU hint)
+- `tools/loader.py` (`a2loader.py` is a re-export shim): format detection and loading. Apple: AppleSingle (ProDOS type/aux), DOS 3.3 4-byte header, `NAME#06AAAA` filenames, raw, ROM images (size → org, vectors, $FBB3/$FBC0 machine ID → CPU hint). Others: CBM .prg/.P00 (+SYS stub entry), Atari .xex (RUNAD/INITAD)/.car, iNES (`--bank`), Lynx BLL/.lnx, BBC sideways ROM header/.inf, OS-ROM signatures. Sets `info["machine_id"]` and `info["entries"]`
+- `tools/machines.py`: `MACHINES` profiles (hw ranges, ROM windows, default CPU, raw-size orgs, OS RAM vector ranges, notes) + the shared markdown-table parser (`parse_table_rows`, `MachineSymbols`). `python3 tools/machines.py --check` loads every machine
 - `tools/dasm6502.py`: recursive-descent + linear-fill disassembler, opcode tables, symbol tables, ca65 output
 - `tools/xref.py`: cross-references, call graph (`--callgraph [--mermaid]`), JSON chunk map (`--sections`)
 - `tools/annotator.py`: split / pattern-annotate / merge for chunked listings; `--merge --reassemble` gives ca65-buildable output; `--apply-symbols` renames generated labels in chunks (keeps comments)
 - `tools/symbols.py`: symbol-file loader: orchard schema-v1.0 JSON, flat JSON, ca65 `NAME = $XXXX ; comment`
-- `reference/apple2_memory_map.md`, `reference/rom_entry_points.md`: markdown tables **parsed by the annotator** (single-address rows only)
+- `reference/apple2_memory_map.md`, `reference/rom_entry_points.md`: Apple II markdown tables **parsed by the annotator** (single-address rows only)
+- `reference/<machine>/memory_map.md`, `rom_entry_points.md`: the other machines' tables, parsed by `machines.py` for **both** the disassembler and the annotator. `reference/MACHINES.md`: machine index, sources, caveats
 - `roms/`: inputs (`demo.as` is an AppleSingle sample built from `tests/fixtures/allmodes.s`); `output/`: generated listings
-- `.claude/skills/`: a2-disassemble, a2-analyze-rom, a2-trace-calls; `.claude/commands/a2-help.md`
+- `.claude/skills/`: `<family>-disassemble|analyze-rom|trace-calls` for a2, cbm, atari8, bbc, nes, lynx; `.claude/commands/<family>-help.md`
 
 All tools support `--help`. No dependencies beyond Python 3.10+; the
 round-trip tests need cc65 (`sudo apt install cc65`).
@@ -34,12 +38,47 @@ python3 -m unittest tests.test_tools.TestLoader.test_applesingle_bin
 
 python3 tools/dasm6502.py roms/demo.as --annotate           # hex listing
 python3 tools/dasm6502.py roms/demo.as --no-hex -o out.s    # reassemblable
+python3 tools/dasm6502.py game.prg --annotate               # machine auto-detected (c64)
+python3 tools/dasm6502.py dump.bin --org 0x1900 --machine bbc_b
+python3 tools/machines.py --check                           # every machine's tables
 ca65 out.s -o out.o && ld65 -t none out.o -o out.bin        # rebuild
 ```
 
+## Machines
+
+- `--machine` (all three tools; ids in `machines.MACHINES`, aliases in `ALIASES`):
+  `--machine` > loader detection (`info["machine_id"]`) > `apple2`.
+- **Apple II keeps its hand-tuned dicts** (`ROM_LABELS` … in `dasm6502.py`)
+  and its listings are byte-stable: no `; Machine:` header line, no
+  vector-hook detection, Apple soft-switch idioms only for apple2. Don't route
+  Apple through `MachineSymbols`.
+- Other machines: `MachineTables` (dasm6502) builds labels from
+  `MachineSymbols`. Rows go to zp (<$100) / hw (profile `hw` ranges) / rom
+  (everything else, including OS RAM variables). Names must be valid ca65
+  symbols and not mnemonics (`_reserved_names`); a repeated name gets its
+  address appended (`PLOT_E50A`); `NAME+n` rows become `NAME+n` operands
+  (`STA CINV+1`) with only `NAME` as an equate.
+- Non-Apple listings carry `; Machine: <id>`; `annotator --split` copies it to
+  `manifest.json["machine"]`, which `--annotate` uses.
+- `_detect_vector_hooks`: an immediate lo/hi pair stored into a profile
+  `os_vectors` range makes the pointer an entry point (non-Apple only).
+- Adding a machine: a `MACHINES` entry + `reference/<id>/` with the two
+  files, and a skill family; the tests load every profile.
+
+## CPUs
+
+`CPU_TABLES`: `6502` (+`--undocumented` → 6502X), `65c02` (base CMOS, Apple
+IIe/IIc), `65sc02` (Lynx) and `65c12` (BBC Master) = same table, `r65c02`
+(+ Rockwell BBR/BBS/RMB/SMB), `w65c02` (Rockwell + WAI/STP). `CA65_CPU` maps
+each to a `.setcpu` name; `CA65_UNSUPPORTED` (WAI/STP) and CMOS reserved
+opcodes (`CMOS_NOP_SIZE`, decoded as `reserved=True` NOPs of 1-3 bytes) are
+emitted as `.byte`. Tracing steps over reserved NOPs; validated/linear fill
+never accepts them. STP ends a trace path.
+
 ## How to Work
 
-Prefer the skills. They encode the token-efficient pipelines:
+Prefer the skills. They encode the token-efficient pipelines (non-Apple
+machines: the same steps under `cbm-`, `atari8-`, `bbc-`, `nes-`, `lynx-`):
 
 - `/a2-disassemble <file>`: annotated disassembly (chunked; main agent reads only the manifest)
 - `/a2-analyze-rom <file>`: ROM identity, vectors, subroutine map
@@ -89,7 +128,8 @@ Prefer the skills. They encode the token-efficient pipelines:
   line (`NAME:`). Keep this format stable.
 - **Symbols**: `ROM_LABELS`/`ROM_DESCRIPTIONS`, `HW_LABELS`/`HW_DESCRIPTIONS`,
   `ZP_LABELS` in `dasm6502.py`. `reference/rom_entry_points.md` is generated from
-  them, so when you add an entry point, update both. Zero-page names are
+  them, so when you add an Apple entry point, update both. Other machines
+  have only their `reference/<machine>/` tables: edit those. Zero-page names are
   applied only to ROM images or with `--zp-names`, because user programs reuse
   zero page.
 

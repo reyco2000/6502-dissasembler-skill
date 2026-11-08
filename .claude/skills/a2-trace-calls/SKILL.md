@@ -5,7 +5,7 @@ description: "Use when the user asks for a call graph, call tree, execution flow
 
 # Trace Apple II Call Graph
 
-Run from `/home/pi/proyectos/6502-dissasembler/`. Use the same flags as for
+Run from the repository root. Use the same flags as for
 disassembly (`--org`, `--cpu`, `--entry`, `--table`, `--symbols`,
 `--data-region`, `--raw`; reuse `output/<name>_flags.txt` if it exists). See
 the `a2-disassemble` skill, step 1. With `--symbols`, routines show up in the
